@@ -385,11 +385,21 @@ fn test_group_by_string() {
                 ("hex".to_string(),
                  locustdb::colgen::random_hex_string(8)),
                 ("scrambled".to_string(),
-                 locustdb::colgen::random_string(2, 16))
+                 locustdb::colgen::random_string(2, 16)),
             ],
         }
     ));
+
     let query = "SELECT scrambled, count(1) FROM test LIMIT 3;";
+    let result = block_on(locustdb.run_query(query, true, vec![])).unwrap().0.unwrap();
+    let expected_rows = vec![
+        [Str("006j267n".to_string()), Int(1)],
+        [Str("00w".to_string()), Int(1)],
+        [Str("0198E".to_string()), Int(1)],
+    ];
+    assert_eq!(result.rows, expected_rows);
+
+    let query = "SELECT scrambled, hex, count(1) FROM test LIMIT 3;";
     let result = block_on(locustdb.run_query(query, true, vec![])).unwrap().0.unwrap();
     let expected_rows = vec![
         [Str("006j267n".to_string()), Int(1)],

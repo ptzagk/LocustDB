@@ -15,6 +15,7 @@ pub enum EncodingType {
     U32,
     U64,
 
+    ByteSlices,
     Premerge,
     MergeOp,
 }

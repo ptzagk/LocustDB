@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::i64;
 
 use chrono::{Datelike, NaiveDateTime};
 use crypto::digest::Digest;
@@ -43,6 +44,9 @@ pub enum QueryPlan {
     BitPack(Box<QueryPlan>, Box<QueryPlan>, i64),
     BitUnpack(Box<QueryPlan>, u8, u8),
 
+    SlicePack(Box<QueryPlan>, EncodingType, usize),
+    SliceUnpack(Box<QueryPlan>, EncodingType, usize),
+
     LessThanVS(EncodingType, Box<QueryPlan>, Box<QueryPlan>),
     EqualsVS(EncodingType, Box<QueryPlan>, Box<QueryPlan>),
     NotEqualsVS(EncodingType, Box<QueryPlan>, Box<QueryPlan>),
@@ -59,6 +63,8 @@ pub enum QueryPlan {
     Filter(Box<QueryPlan>, EncodingType, Box<QueryPlan>),
 
     EncodedGroupByPlaceholder,
+
+    Convergence(Vec<Box<QueryPlan>>),
 
     Constant(RawVal, bool),
 }
@@ -417,100 +423,6 @@ impl QueryPlan {
         })
     }
 
-    pub fn compile_grouping_key(
-        exprs: &[Expr],
-        filter: Filter,
-        columns: &HashMap<String, Arc<Column>>)
-        -> Result<(TypedPlan, i64, Vec<TypedPlan>), QueryError> {
-        if exprs.len() == 1 {
-            QueryPlan::create_query_plan(&exprs[0], filter, columns)
-                .map(|(gk_plan, gk_type)| {
-                    let max_cardinality = QueryPlan::encoding_range(&gk_plan).map_or(1 << 62, |i| i.1);
-                    if QueryPlan::encoding_range(&gk_plan).is_none() {
-                        warn!("Unknown range for {:?}", &gk_plan);
-                    }
-                    let decoded_group_by = gk_type.codec.clone().map_or(
-                        QueryPlan::EncodedGroupByPlaceholder,
-                        |codec| *codec.decode(Box::new(QueryPlan::EncodedGroupByPlaceholder)));
-                    ((gk_plan.clone(), gk_type.clone()),
-                     max_cardinality,
-                     vec![(decoded_group_by, gk_type.decoded())])
-                })
-        } else {
-            let mut total_width = 0;
-            let mut largest_key = 0;
-            let mut plan = None;
-            let mut decode_plans = Vec::with_capacity(exprs.len());
-            let mut order_preserving = true;
-            for expr in exprs.iter().rev() {
-                let (query_plan, plan_type) = QueryPlan::create_query_plan(expr, filter, columns)?;
-                if let Some((min, max)) = QueryPlan::encoding_range(&query_plan) {
-                    fn bits(max: i64) -> i64 {
-                        ((max + 1) as f64).log2().ceil() as i64
-                    }
-
-                    // TODO(clemens): more intelligent criterion. threshold should probably be a function of total width.
-                    let subtract_offset = bits(max) - bits(max - min) > 1 || min < 0;
-                    let adjusted_max = if subtract_offset { max - min } else { max };
-                    order_preserving = order_preserving && plan_type.is_order_preserving();
-                    let query_plan = if subtract_offset {
-                        QueryPlan::AddVS(plan_type.encoding_type(),
-                                         Box::new(query_plan),
-                                         Box::new(QueryPlan::Constant(RawVal::Int(-min), true)))
-                    } else {
-                        syntax::cast(query_plan, plan_type.encoding_type(), EncodingType::I64)
-                    };
-
-                    #[cfg(feature = "nerf")]
-                    let nerf = true;
-                    #[cfg(not(feature = "nerf"))]
-                    let nerf = false;
-
-                    if total_width == 0 && (!nerf || plan.is_none()) {
-                        plan = Some(query_plan);
-                    } else if adjusted_max > 0 || nerf {
-                        plan = plan.map(|plan|
-                            QueryPlan::BitPack(Box::new(plan), Box::new(query_plan), total_width));
-                    }
-
-                    let mut decode_plan = QueryPlan::BitUnpack(
-                        Box::new(QueryPlan::EncodedGroupByPlaceholder),
-                        total_width as u8,
-                        bits(adjusted_max) as u8);
-                    if subtract_offset {
-                        decode_plan = QueryPlan::AddVS(
-                            EncodingType::I64,
-                            Box::new(decode_plan),
-                            Box::new(QueryPlan::Constant(RawVal::Int(min), true)));
-                    }
-                    decode_plan = syntax::cast(decode_plan, EncodingType::I64, plan_type.encoding_type());
-                    if let Some(codec) = plan_type.codec.clone() {
-                        decode_plan = *codec.decode(Box::new(decode_plan));
-                    }
-                    decode_plans.push((decode_plan, plan_type.decoded()));
-
-                    largest_key += adjusted_max << total_width;
-                    total_width += bits(adjusted_max);
-                } else {
-                    plan = None;
-                    break;
-                }
-            }
-
-            if let Some(plan) = plan {
-                if total_width <= 64 {
-                    decode_plans.reverse();
-                    let t = Type::encoded(Codec::opaque(
-                        EncodingType::I64, BasicType::Integer, false, order_preserving, true, true));
-                    return Ok(((plan, t), largest_key, decode_plans));
-                }
-            }
-            // TODO(clemens): add more grouping key widths (u32. u16?)
-            // TODO(clemens): implement general case using bites slice as grouping key
-            bail!(QueryError::NotImplemented, "Failed to pack group by columns into 64 bit value")
-        }
-    }
-
     fn encoding_range(&self) -> Option<(i64, i64)> {
         // TODO(clemens): need more principled approach - this currently doesn't work for all partially decodings
         // Example: [LZ4, Add, Delta] will have as bottom decoding range the range after Delta, but without the Add :/
@@ -761,6 +673,131 @@ fn replace_common_subexpression(plan: QueryPlan, executor: &mut QueryExecutor) -
             None => (Box::new(plan), signature),
         }
     }
+}
+
+pub fn compile_grouping_key(
+    exprs: &[Expr],
+    filter: Filter,
+    columns: &HashMap<String, Arc<Column>>)
+    -> Result<(TypedPlan, i64, Vec<TypedPlan>), QueryError> {
+    if exprs.len() == 1 {
+        QueryPlan::create_query_plan(&exprs[0], filter, columns)
+            .map(|(gk_plan, gk_type)| {
+                let max_cardinality = QueryPlan::encoding_range(&gk_plan).map_or(1 << 62, |i| i.1);
+                if QueryPlan::encoding_range(&gk_plan).is_none() {
+                    warn!("Unknown range for {:?}", &gk_plan);
+                }
+                let decoded_group_by = gk_type.codec.clone().map_or(
+                    QueryPlan::EncodedGroupByPlaceholder,
+                    |codec| *codec.decode(Box::new(QueryPlan::EncodedGroupByPlaceholder)));
+                ((gk_plan.clone(), gk_type.clone()),
+                 max_cardinality,
+                 vec![(decoded_group_by, gk_type.decoded())])
+            })
+    } else if let Some(result) = try_bitpacking(exprs, filter, columns)? {
+        Ok(result)
+    } else {
+        info!("Failed to bitpack grouping key");
+        let mut pack = Vec::new();
+        let mut decode_plans = Vec::new();
+        for (i, expr) in exprs.iter().enumerate() {
+            let (query_plan, plan_type) = QueryPlan::create_query_plan(expr, filter, columns)?;
+            pack.push(Box::new(
+                QueryPlan::SlicePack(Box::new(query_plan),
+                                     plan_type.encoding_type(),
+                                     i)));
+            decode_plans.push(
+                (QueryPlan::SliceUnpack(Box::new(query_plan),
+                                        plan_type.encoding_type(),
+                                        i),
+                 plan_type.decoded()));
+        }
+        let t = Type::encoded(Codec::opaque(
+            EncodingType::ByteSlices,
+            BasicType::Val,
+            /* is_summation_preserving */ false,
+            /* is_order_preserving */ true,
+            /* is_positive_integer */ false,
+            /* is_fixed_width */ false,
+        ));
+        Ok(((QueryPlan::Convergence(pack), t),
+            i64::MAX,
+            decode_plans))
+    }
+}
+
+fn try_bitpacking(
+    exprs: &[Expr],
+    filter: Filter,
+    columns: &HashMap<String, Arc<Column>>)
+    -> Result<Option<(TypedPlan, i64, Vec<TypedPlan>)>, QueryError> {
+    // TODO(clemens): use u64 as grouping key type
+    let mut total_width = 0;
+    let mut largest_key = 0;
+    let mut plan = None;
+    let mut decode_plans = Vec::with_capacity(exprs.len());
+    let mut order_preserving = true;
+    for expr in exprs.iter().rev() {
+        let (query_plan, plan_type) = QueryPlan::create_query_plan(expr, filter, columns)?;
+        if let Some((min, max)) = QueryPlan::encoding_range(&query_plan) {
+            fn bits(max: i64) -> i64 {
+                ((max + 1) as f64).log2().ceil() as i64
+            }
+
+            // TODO(clemens): more intelligent criterion. threshold should probably be a function of total width.
+            let subtract_offset = bits(max) - bits(max - min) > 1 || min < 0;
+            let adjusted_max = if subtract_offset { max - min } else { max };
+            order_preserving = order_preserving && plan_type.is_order_preserving();
+            let query_plan = if subtract_offset {
+                QueryPlan::AddVS(plan_type.encoding_type(),
+                                 Box::new(query_plan),
+                                 Box::new(QueryPlan::Constant(RawVal::Int(-min), true)))
+            } else {
+                syntax::cast(query_plan, plan_type.encoding_type(), EncodingType::I64)
+            };
+
+            if total_width == 0 {
+                plan = Some(query_plan);
+            } else if adjusted_max > 0 {
+                plan = plan.map(|plan|
+                    QueryPlan::BitPack(Box::new(plan), Box::new(query_plan), total_width));
+            }
+
+            let mut decode_plan = QueryPlan::BitUnpack(
+                Box::new(QueryPlan::EncodedGroupByPlaceholder),
+                total_width as u8,
+                bits(adjusted_max) as u8);
+            if subtract_offset {
+                decode_plan = QueryPlan::AddVS(
+                    EncodingType::I64,
+                    Box::new(decode_plan),
+                    Box::new(QueryPlan::Constant(RawVal::Int(min), true)));
+            }
+            decode_plan = syntax::cast(decode_plan, EncodingType::I64, plan_type.encoding_type());
+            if let Some(codec) = plan_type.codec.clone() {
+                decode_plan = *codec.decode(Box::new(decode_plan));
+            }
+            decode_plans.push((decode_plan, plan_type.decoded()));
+
+            largest_key += adjusted_max << total_width;
+            total_width += bits(adjusted_max);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    Ok(
+        if total_width <= 64 {
+            plan.map(|plan| {
+                decode_plans.reverse();
+                let t = Type::encoded(Codec::opaque(
+                    EncodingType::I64, BasicType::Integer, false, order_preserving, true, true));
+                ((plan, t), largest_key, decode_plans)
+            })
+        } else {
+            None
+        }
+    )
 }
 
 fn to_hex_string(bytes: &[u8]) -> String {

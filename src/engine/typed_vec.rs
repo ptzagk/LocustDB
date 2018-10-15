@@ -450,7 +450,7 @@ impl GenericVec<Premerge> for Premerge {
 }
 
 
-fn display_slice<T: Display>(slice: &[T], max_chars: usize) -> String {
+pub fn display_slice<T: Display>(slice: &[T], max_chars: usize) -> String {
     let mut length = slice.len();
     loop {
         let result = _display_slice(slice, length);
